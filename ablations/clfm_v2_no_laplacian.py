@@ -1,0 +1,193 @@
+"""
+CLFMv2 Ablation: No Graph Laplacian Diffusion
+==============================================
+Removes the static road-graph Laplacian term  α·L·F  from the PDE.
+The PDE becomes:  dF/dt = N_θ(F)   (purely neural, no graph structure).
+
+Purpose: Measure the contribution of explicit road-topology-based
+         spatial diffusion to forecasting accuracy.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+from ..arch.mlp import MultiLayerPerceptron
+from ..arch.clfm_v2 import (
+    NeuralPDEOperator,
+    ContinuousStateSpace,
+    LatentFieldEncoder,
+    LatentFieldDecoder,
+)
+
+
+class CLFMv2_NoLaplacian(nn.Module):
+    """CLFMv2 without Graph Laplacian diffusion.
+
+    PDE step becomes:  dF/dt = N_θ(F)
+    (no α·L·F term, no pde_mix parameter, no GraphLaplacianOperator).
+    """
+
+    def __init__(self, **model_args):
+        super().__init__()
+
+        # ==================== Core dimensions ====================
+        self.num_nodes  = model_args["num_nodes"]
+        self.input_len  = model_args["input_len"]
+        self.input_dim  = model_args["input_dim"]
+        self.output_len = model_args["output_len"]
+
+        # ==================== Field parameters ====================
+        self.field_dim      = model_args.get("field_dim", 32)
+        self.hidden_dim     = model_args.get("hidden_dim", 64)
+        self.num_pde_steps  = model_args.get("num_pde_steps", 4)
+        self.encoder_layers = model_args.get("encoder_layers", 2)
+        self.decoder_layers = model_args.get("decoder_layers", 2)
+        self.pde_layers     = model_args.get("pde_layers", 2)
+
+        # ==================== Loss weights ====================
+        self.smoothness_weight = model_args.get("smoothness_weight", 0.1)
+
+        # ==================== Temporal embedding config ====================
+        self.if_time_in_day  = model_args.get("if_T_i_D", True)
+        self.if_day_in_week  = model_args.get("if_D_i_W", True)
+        self.time_of_day_size = model_args.get("time_of_day_size", 288)
+        self.day_of_week_size = model_args.get("day_of_week_size", 7)
+        self.temp_dim_tid    = model_args.get("temp_dim_tid", 16)
+        self.temp_dim_diw    = model_args.get("temp_dim_diw", 16)
+
+        # ============================================================
+        # Temporal Embeddings
+        # ============================================================
+        if self.if_time_in_day:
+            self.time_in_day_emb = nn.Parameter(
+                torch.empty(self.time_of_day_size, self.temp_dim_tid))
+            nn.init.xavier_uniform_(self.time_in_day_emb)
+        if self.if_day_in_week:
+            self.day_in_week_emb = nn.Parameter(
+                torch.empty(self.day_of_week_size, self.temp_dim_diw))
+            nn.init.xavier_uniform_(self.day_in_week_emb)
+
+        temp_emb_dim = (self.temp_dim_tid * int(self.if_time_in_day)
+                        + self.temp_dim_diw * int(self.if_day_in_week))
+        if temp_emb_dim > 0:
+            self.temp_to_field = nn.Linear(temp_emb_dim, self.field_dim)
+        else:
+            self.temp_to_field = None
+
+        # ============================================================
+        # 1. Latent Field Encoder
+        # ============================================================
+        self.encoder = LatentFieldEncoder(
+            input_dim=self.input_dim,
+            input_len=self.input_len,
+            field_dim=self.field_dim,
+            hidden_dim=self.hidden_dim,
+            num_nodes=self.num_nodes,
+            num_layers=self.encoder_layers,
+        )
+
+        # ============================================================
+        # 2. NO GraphLaplacianOperator — ABLATED
+        # ============================================================
+
+        # ============================================================
+        # 3. Neural PDE Operator (kept)
+        # ============================================================
+        self.neural_pde = NeuralPDEOperator(
+            field_dim=self.field_dim,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.pde_layers,
+        )
+
+        # ============================================================
+        # 4. Continuous State Space (kept)
+        # ============================================================
+        self.state_space = ContinuousStateSpace(
+            field_dim=self.field_dim,
+            state_dim=self.field_dim,
+        )
+
+        # ============================================================
+        # 5. Decoder (kept)
+        # ============================================================
+        self.decoder = LatentFieldDecoder(
+            field_dim=self.field_dim,
+            output_len=self.output_len,
+            hidden_dim=self.hidden_dim,
+            num_nodes=self.num_nodes,
+            num_layers=self.decoder_layers,
+        )
+
+        # No pde_mix parameter needed — purely neural PDE
+
+    # ------------------------------------------------------------------
+    def _get_temporal_field_bias(self, history_data):
+        parts = []
+        if self.if_time_in_day:
+            t_i_d = history_data[..., 1]
+            idx = (t_i_d[:, -1, :] * self.time_of_day_size).long().clamp(
+                0, self.time_of_day_size - 1)
+            parts.append(self.time_in_day_emb[idx])
+        if self.if_day_in_week:
+            d_i_w = history_data[..., 2]
+            idx = (d_i_w[:, -1, :] * self.day_of_week_size).long().clamp(
+                0, self.day_of_week_size - 1)
+            parts.append(self.day_in_week_emb[idx])
+        if parts and self.temp_to_field is not None:
+            temp_emb = torch.cat(parts, dim=-1)
+            return self.temp_to_field(temp_emb)
+        return None
+
+    # ------------------------------------------------------------------
+    def _pde_step(self, field, state, dt=1.0):
+        """PDE step WITHOUT Laplacian: dF/dt = N_θ(F)."""
+        # Only neural term — no graph diffusion
+        dF = self.neural_pde(field)
+
+        # Euler step
+        field_evolved = field + dF * dt
+
+        # Refine through continuous state space
+        field_refined, new_state = self.state_space(field_evolved, state)
+
+        return field_refined, new_state, dF
+
+    # ------------------------------------------------------------------
+    def compute_smoothness_loss(self, derivatives):
+        loss = torch.tensor(0.0, device=derivatives[0].device)
+        for dF in derivatives:
+            loss = loss + (dF ** 2).mean()
+        return loss / max(len(derivatives), 1)
+
+    # ------------------------------------------------------------------
+    def forward(self, history_data, future_data, batch_seen, epoch, train, **kwargs):
+        input_data = history_data[..., :self.input_dim]
+
+        # Encode
+        field = self.encoder(input_data)
+
+        # Temporal bias
+        temp_bias = self._get_temporal_field_bias(history_data)
+        if temp_bias is not None:
+            field = field + temp_bias
+
+        # PDE evolution (no Laplacian)
+        state = None
+        derivatives = []
+        dt = 1.0 / self.num_pde_steps
+
+        for _ in range(self.num_pde_steps):
+            field, state, dF = self._pde_step(field, state, dt)
+            derivatives.append(dF)
+
+        # Decode
+        prediction = self.decoder(field)
+
+        result = {"prediction": prediction}
+        if train:
+            result["smoothness_loss"] = (
+                self.compute_smoothness_loss(derivatives) * self.smoothness_weight
+            )
+        return result
